@@ -1,0 +1,65 @@
+name: "Fork validation (delta-jvm)"
+
+# Fork-only. Runs a single test class with the change and, in a second job, with the main-source
+# change reverted to check that the new test fails for the expected reason.
+on:
+  push:
+    branches: ['validate/delta-jvm-**']
+  workflow_dispatch:
+
+env:
+  SBT_OPTS: "-Dsbt.coursier.home-dir=/home/runner/.cache/coursier -Dsbt.ivy.home=/home/runner/.ivy2"
+  SUITE: io.delta.storage.commit.uccommitcoordinator.UCDeltaTokenBasedRestClientSuite
+  MAIN_FILE: storage/src/main/java/io/delta/storage/commit/uccommitcoordinator/UCDeltaTokenBasedRestClient.java
+
+jobs:
+  with-change:
+    name: "storage: whole suite with the change"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: "zulu"
+          java-version: "17"
+      - name: Set up pinned Unity Catalog
+        uses: ./.github/actions/setup-unitycatalog
+      - name: Run suite
+        run: build/sbt "storage/testOnly $SUITE"
+
+  without-change:
+    name: "storage: new test with the main-source change reverted (expected to fail)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 3
+      - name: Revert only the main-source file to the parent of the change
+        run: |
+          git log --oneline -3
+          git checkout HEAD~2 -- "$MAIN_FILE"
+          git diff --cached --stat
+          test -n "$(git diff --cached --stat)"
+          ! grep -q "HTTP_TOO_MANY_REQUESTS" "$MAIN_FILE"
+      - name: Install Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: "zulu"
+          java-version: "17"
+      - name: Set up pinned Unity Catalog
+        uses: ./.github/actions/setup-unitycatalog
+      - name: Run only the 429 tests; the commit-limit one must fail because an IOException is thrown
+        run: |
+          set +e
+          build/sbt "storage/testOnly $SUITE -- -z \"429\"" 2>&1 | tee sbt.log
+          set -e
+          grep -q "commit throws CommitLimitReachedException on 429 ResourceExhausted \*\*\* FAILED \*\*\*" sbt.log
+          grep -q "but java.io.IOException was thrown" sbt.log
+          grep -q "commit keeps 429 TooManyRequests as a transient IOException" sbt.log
+          ! grep -q "transient IOException \*\*\* FAILED" sbt.log
+          echo "baseline failed for the expected reason"
